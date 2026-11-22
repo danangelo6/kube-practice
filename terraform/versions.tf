@@ -11,8 +11,11 @@ terraform {
   # Bucket/key/region are passed at init time: see README step 3.
   # use_lockfile = S3-native state locking (no DynamoDB table needed).
   backend "s3" {
-    use_lockfile = true
+    bucket       = "sample-app-tfstate-437655433739"
+    key          = "sample-app/terraform.tfstate"
+    region       = "ap-southeast-1"
     encrypt      = true
+    use_lockfile = true
   }
 }
 
