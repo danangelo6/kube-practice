@@ -1,0 +1,127 @@
+name: CI/CD (EKS)
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["terraform/**", "bootstrap/**", "k3s/**", "*.md"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECR_REPOSITORY: sample-app
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - run: npm ci
+        working-directory: app
+      - run: npm test
+        working-directory: app
+
+  security-and-build:
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.push.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Repo scan: dependency CVEs, leaked secrets, Dockerfile + Kubernetes manifest misconfigurations.
+      # Terraform is checked separately (terraform.yml) so IaC findings don't block app deploys.
+      - name: Trivy repo scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          skip-dirs: terraform,bootstrap,k3s
+          exit-code: "1"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Configure AWS credentials (OIDC)
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Push image
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        id: push
+        run: |
+          IMAGE="${{ steps.ecr.outputs.registry }}/${ECR_REPOSITORY}:${GITHUB_SHA}"
+          docker tag "${ECR_REPOSITORY}:${GITHUB_SHA}" "$IMAGE"
+          docker push "$IMAGE"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: security-and-build
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: production   # optional: add required reviewers in repo Settings > Environments
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Connect kubectl to EKS
+        run: aws eks update-kubeconfig --region "$AWS_REGION" --name "${{ vars.EKS_CLUSTER_NAME }}"
+
+      - name: Deploy
+        env:
+          IMAGE: ${{ needs.security-and-build.outputs.image }}
+        run: |
+          mkdir -p rendered
+          for f in k8s-eks/*.yaml; do
+            sed -e "s|IMAGE_PLACEHOLDER|${IMAGE}|g" -e "s|VERSION_PLACEHOLDER|${GITHUB_SHA::7}|g" "$f" > "rendered/$(basename "$f")"
+          done
+          kubectl apply -f rendered/namespace.yaml
+          kubectl apply -f rendered/
+          kubectl -n sample-app rollout status deployment/sample-app --timeout=300s
+
+      - name: Show endpoint
+        run: |
+          kubectl -n sample-app get svc sample-app -o wide
+          echo "Load balancer hostname:"
+          kubectl -n sample-app get svc sample-app -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'; echo

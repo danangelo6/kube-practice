@@ -1,0 +1,139 @@
+name: CI/CD (k3s legacy, manual)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # needed for AWS OIDC
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECR_REPOSITORY: sample-app
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - run: npm ci
+        working-directory: app
+      - run: npm test
+        working-directory: app
+
+  security-and-build:
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # 1) Trivy filesystem scan: dependencies, secrets, Dockerfile/K8s misconfigurations
+      - name: Trivy repo scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          skip-dirs: terraform,k3s
+
+      - uses: docker/setup-buildx-action@v3
+
+      # 2) Build image locally (not pushed yet)
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # 3) Trivy image scan: fail the pipeline on fixable HIGH/CRITICAL CVEs
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      # 4) Only on main: push to ECR
+      - name: Configure AWS credentials (OIDC)
+        if: github.ref == 'refs/heads/main'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        if: github.ref == 'refs/heads/main'
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Push image
+        if: github.ref == 'refs/heads/main'
+        id: meta
+        run: |
+          IMAGE="${{ steps.ecr.outputs.registry }}/${ECR_REPOSITORY}:${GITHUB_SHA}"
+          docker tag "${ECR_REPOSITORY}:${GITHUB_SHA}" "$IMAGE"
+          docker push "$IMAGE"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: security-and-build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Render manifests with the new image and ship them to the k3s node via AWS SSM
+      # (no SSH key and no open port 22 / 6443 needed)
+      - name: Deploy through SSM
+        env:
+          INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+          IMAGE: ${{ needs.security-and-build.outputs.image }}
+        run: |
+          REGISTRY="${IMAGE%%/*}"
+          MANIFESTS=$(for f in k3s/manifests/namespace.yaml k3s/manifests/deployment.yaml k3s/manifests/service.yaml k3s/manifests/ingress.yaml; do
+              sed -e "s|IMAGE_PLACEHOLDER|${IMAGE}|g" -e "s|VERSION_PLACEHOLDER|${GITHUB_SHA::7}|g" "$f"
+              printf '\n---\n'
+            done | base64 -w0)
+
+          cat > params.json <<JSON
+          {"commands":[
+            "set -e",
+            "export KUBECONFIG=/etc/rancher/k3s/k3s.yaml",
+            "echo '${MANIFESTS}' | base64 -d > /tmp/app.yaml",
+            "kubectl create namespace sample-app --dry-run=client -o yaml | kubectl apply -f -",
+            "kubectl -n sample-app create secret docker-registry ecr-creds --docker-server=${REGISTRY} --docker-username=AWS --docker-password=\"\$(aws ecr get-login-password --region ${AWS_REGION})\" --dry-run=client -o yaml | kubectl apply -f -",
+            "kubectl apply -f /tmp/app.yaml",
+            "kubectl -n sample-app rollout status deployment/sample-app --timeout=180s"
+          ]}
+          JSON
+
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --parameters file://params.json \
+            --query "Command.CommandId" --output text)
+
+          aws ssm wait command-executed --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" || true
+          aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+            --query "{Status:Status,Out:StandardOutputContent,Err:StandardErrorContent}" --output yaml
+          STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" --query Status --output text)
+          [ "$STATUS" = "Success" ]

@@ -1,0 +1,21 @@
+# Lean Prometheus for a small single-node cluster
+# chart: prometheus-community/prometheus
+alertmanager:
+  enabled: false
+prometheus-pushgateway:
+  enabled: false
+prometheus-node-exporter:
+  enabled: true
+  resources:
+    limits: { memory: 32Mi }
+kube-state-metrics:
+  enabled: true
+  resources:
+    limits: { memory: 64Mi }
+server:
+  retention: 3d
+  persistentVolume:
+    enabled: false      # use a PVC/EBS in real environments
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits:   { memory: 256Mi }

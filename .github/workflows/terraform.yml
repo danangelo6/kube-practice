@@ -1,0 +1,38 @@
+name: Terraform checks
+
+on:
+  pull_request:
+    paths: ["terraform/**", "bootstrap/**"]
+  push:
+    branches: [main]
+    paths: ["terraform/**", "bootstrap/**"]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.12.2
+      - name: Format check
+        run: terraform fmt -check -recursive
+      - name: Validate (no AWS access needed)
+        working-directory: terraform
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate
+
+  checkov:
+    # Checkov is an open-source IaC scanner. soft_fail keeps it advisory: read the findings and fix what matters.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: terraform
+          framework: terraform
+          soft_fail: true

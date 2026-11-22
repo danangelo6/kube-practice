@@ -1,0 +1,9 @@
+node_modules
+.git
+.github
+k8s-eks
+k3s
+terraform
+monitoring
+*.md
+app/test

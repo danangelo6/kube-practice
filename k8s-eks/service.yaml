@@ -1,0 +1,16 @@
+# Type LoadBalancer makes EKS create an AWS Network Load Balancer.
+# Upgrade path: install the AWS Load Balancer Controller and use an ALB Ingress with TLS.
+apiVersion: v1
+kind: Service
+metadata:
+  name: sample-app
+  namespace: sample-app
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+spec:
+  type: LoadBalancer
+  selector:
+    app: sample-app
+  ports:
+    - port: 80
+      targetPort: 3000
